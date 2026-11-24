@@ -1,33 +1,51 @@
 #!/usr/bin/env python
-# ДЗ 3. Обучение ранжированию — шаблон решения.
-#
-# Обучение:  ./solution.py --train --model_file=model.bin PATH-TO-DATA
-# Сабмишн:   ./solution.py --model_file=model.bin --submission_file=submission.csv PATH-TO-DATA
 
 import argparse
 import os
 from timeit import default_timer as timer
 
+import numpy as np
 import pandas as pd
+from catboost import CatBoostRanker, Pool
 
 
 def train(data_dir, model_file):
     data = pd.read_csv(os.path.join(data_dir, 'train.csv'))
+    data = data.sort_values('QueryId', kind='stable')
     features = [column for column in data.columns if column not in ('QueryId', 'Label')]
 
-    # TODO:
-    # - отложить часть запросов (целиком, не отдельные строки) и сравнивать варианты по nDCG@10 на них;
-    # - обучить модель ранжирования на data[features] и data['Label'], группы — data['QueryId'];
-    # - сохранить модель в model_file.
+    queries = np.random.default_rng(42).permutation(data['QueryId'].unique())
+    valid_mask = data['QueryId'].isin(queries[:len(queries) // 5])
+    train_data = data.loc[~valid_mask]
+    valid_data = data.loc[valid_mask]
+    valid_pool = Pool(valid_data[features], valid_data['Label'], group_id=valid_data['QueryId'])
+
+    params = dict(
+        loss_function='YetiRank',
+        eval_metric='NDCG:top=10;type=Exp',
+        iterations=1000,
+        depth=6,
+        learning_rate=0.05,
+        random_seed=42,
+        thread_count=4,
+        allow_writing_files=False,
+    )
+    model = CatBoostRanker(**params)
+    model.fit(
+        train_data[features], train_data['Label'], group_id=train_data['QueryId'],
+        eval_set=valid_pool, early_stopping_rounds=100, use_best_model=True, verbose=100,
+    )
+    params['iterations'] = model.tree_count_
+    model = CatBoostRanker(**params)
+    model.fit(data[features], data['Label'], group_id=data['QueryId'], verbose=100)
+    model.save_model(model_file)
 
 
 def predict(data_dir, model_file, submission_file):
     test = pd.read_csv(os.path.join(data_dir, 'test.csv'))
-    features = [column for column in test.columns if column not in ('ObjectId', 'QueryId')]
-
-    # TODO: загрузить модель из model_file и посчитать скор для каждой строки test[features].
-    scores = [0.0] * len(test)  # замените своими скорами
-
+    model = CatBoostRanker()
+    model.load_model(model_file)
+    scores = model.predict(test[model.feature_names_], thread_count=4)
     submission = pd.DataFrame({'ObjectId': test['ObjectId'], 'Score': scores})
     submission.to_csv(submission_file, index=False)
 
@@ -41,8 +59,6 @@ def main():
     args = parser.parse_args()
 
     start = timer()
-
-    # Если в решении есть случайность, зафиксируйте seed: random_seed у CatBoost, seed у LightGBM и т. п.
 
     if args.train:
         train(args.data_dir, args.model_file)
